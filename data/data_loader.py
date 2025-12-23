@@ -2,6 +2,7 @@
 数据加载模块
 功能：从MoleculeNet、ChEMBL等数据源加载药物数据集
 数据将下载到本地data目录
+支持分层采样确保训练/验证/测试集分布一致
 """
 
 import pandas as pd
@@ -18,6 +19,12 @@ try:
 except ImportError:
     DEEPCHEM_AVAILABLE = False
     print("Warning: DeepChem not installed. Some features may be unavailable.")
+
+try:
+    from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
 
 class DrugDataLoader:
@@ -109,6 +116,126 @@ class DrugDataLoader:
                                       tasks, dataset_name)
         
         return train_dataset, valid_dataset, test_dataset, tasks
+    
+    def load_moleculenet_with_stratified_split(self, 
+                                                dataset_name: str = 'BBBP',
+                                                featurizer: str = 'ECFP',
+                                                train_ratio: float = 0.8,
+                                                val_ratio: float = 0.1,
+                                                test_ratio: float = 0.1,
+                                                random_state: int = 42) -> Tuple:
+        """
+        从MoleculeNet加载数据集，使用分层采样确保分布一致
+        
+        Args:
+            dataset_name: 数据集名称
+            featurizer: 特征化方法
+            train_ratio: 训练集比例
+            val_ratio: 验证集比例  
+            test_ratio: 测试集比例
+            random_state: 随机种子
+            
+        Returns:
+            (X_train, y_train, X_val, y_val, X_test, y_test, tasks)
+        """
+        if not DEEPCHEM_AVAILABLE:
+            raise ImportError("DeepChem is required")
+        if not SKLEARN_AVAILABLE:
+            raise ImportError("scikit-learn is required for stratified split")
+        
+        print(f"Loading {dataset_name} with stratified split...")
+        
+        # 先用random split加载全部数据
+        data_save_dir = os.path.join(self.data_dir, dataset_name.lower())
+        os.makedirs(data_save_dir, exist_ok=True)
+        
+        if dataset_name.upper() == 'BBBP':
+            tasks, datasets, transformers = dc.molnet.load_bbbp(
+                featurizer=featurizer, 
+                splitter='random',
+                reload=False,
+                data_dir=data_save_dir
+            )
+        elif dataset_name.upper() == 'ESOL':
+            tasks, datasets, transformers = dc.molnet.load_delaney(
+                featurizer=featurizer, 
+                splitter='random',
+                reload=False,
+                data_dir=data_save_dir
+            )
+        elif dataset_name.upper() == 'BACE':
+            tasks, datasets, transformers = dc.molnet.load_bace_classification(
+                featurizer=featurizer, 
+                splitter='random',
+                reload=False,
+                data_dir=data_save_dir
+            )
+        else:
+            raise ValueError(f"Unsupported dataset: {dataset_name}")
+        
+        # 合并所有数据
+        train_data, valid_data, test_data = datasets
+        
+        X_all = np.vstack([train_data.X, valid_data.X, test_data.X])
+        y_all = np.vstack([train_data.y, valid_data.y, test_data.y]).flatten()
+        
+        # 处理NaN
+        y_all = np.nan_to_num(y_all, nan=0.0)
+        
+        print(f"Total samples: {len(X_all)}")
+        print(f"Feature dimension: {X_all.shape[1]}")
+        
+        # 对分类任务使用分层采样
+        if dataset_name.upper() in ['BBBP', 'BACE', 'TOX21']:
+            # 二分类任务 - 使用分层采样
+            y_labels = (y_all > 0.5).astype(int)
+            
+            # 第一次分割：分出测试集
+            X_temp, X_test, y_temp, y_test = train_test_split(
+                X_all, y_all,
+                test_size=test_ratio,
+                stratify=y_labels,
+                random_state=random_state
+            )
+            
+            # 第二次分割：从剩余数据中分出验证集
+            val_ratio_adjusted = val_ratio / (train_ratio + val_ratio)
+            y_temp_labels = (y_temp > 0.5).astype(int)
+            
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_temp, y_temp,
+                test_size=val_ratio_adjusted,
+                stratify=y_temp_labels,
+                random_state=random_state
+            )
+            
+            # 打印分布信息
+            print(f"\n分层采样后的类别分布:")
+            print(f"  训练集: {len(X_train)} 样本, 正例比例: {(y_train > 0.5).mean():.2%}")
+            print(f"  验证集: {len(X_val)} 样本, 正例比例: {(y_val > 0.5).mean():.2%}")
+            print(f"  测试集: {len(X_test)} 样本, 正例比例: {(y_test > 0.5).mean():.2%}")
+            
+        else:
+            # 回归任务 - 使用随机分割
+            X_temp, X_test, y_temp, y_test = train_test_split(
+                X_all, y_all,
+                test_size=test_ratio,
+                random_state=random_state
+            )
+            
+            val_ratio_adjusted = val_ratio / (train_ratio + val_ratio)
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_temp, y_temp,
+                test_size=val_ratio_adjusted,
+                random_state=random_state
+            )
+            
+            print(f"\n随机分割后的数据分布:")
+            print(f"  训练集: {len(X_train)} 样本, 均值: {y_train.mean():.3f}")
+            print(f"  验证集: {len(X_val)} 样本, 均值: {y_val.mean():.3f}")
+            print(f"  测试集: {len(X_test)} 样本, 均值: {y_test.mean():.3f}")
+        
+        return X_train, y_train, X_val, y_val, X_test, y_test, tasks
     
     def _save_dataset_to_csv(self, train_data, valid_data, test_data, 
                               tasks, dataset_name: str):

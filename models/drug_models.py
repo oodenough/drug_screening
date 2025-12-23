@@ -1,6 +1,7 @@
 """
 深度学习模型定义
 包含：MLP、CNN、Multi-task DNN等多种模型架构
+支持多种正则化策略防止过拟合
 """
 
 import torch
@@ -63,6 +64,101 @@ class DrugPredictorMLP(nn.Module):
         
         # 注意：二分类任务输出logits，配合BCEWithLogitsLoss使用
         # 推理时需要手动应用sigmoid
+        if self.task_type == 'multiclass':
+            output = F.softmax(output, dim=1)
+        
+        return output
+
+
+class DrugPredictorMLPv2(nn.Module):
+    """
+    增强版MLP模型 - 支持更多正则化策略
+    适用于容易过拟合的小数据集
+    """
+    
+    def __init__(self, 
+                 input_dim: int,
+                 hidden_dims: List[int] = [256, 128, 64],
+                 output_dim: int = 1,
+                 dropout: float = 0.5,
+                 use_batch_norm: bool = True,
+                 use_layer_norm: bool = False,
+                 activation: str = 'relu',
+                 task_type: str = 'regression'):
+        """
+        Args:
+            input_dim: 输入特征维度
+            hidden_dims: 隐藏层维度列表（默认更小以减少过拟合）
+            output_dim: 输出维度
+            dropout: Dropout比例（默认更高）
+            use_batch_norm: 是否使用批归一化
+            use_layer_norm: 是否使用层归一化
+            activation: 激活函数类型 ('relu', 'leaky_relu', 'elu', 'selu')
+            task_type: 任务类型
+        """
+        super(DrugPredictorMLPv2, self).__init__()
+        
+        self.task_type = task_type
+        
+        # 选择激活函数
+        if activation == 'relu':
+            act_fn = nn.ReLU()
+        elif activation == 'leaky_relu':
+            act_fn = nn.LeakyReLU(0.1)
+        elif activation == 'elu':
+            act_fn = nn.ELU()
+        elif activation == 'selu':
+            act_fn = nn.SELU()
+        else:
+            act_fn = nn.ReLU()
+        
+        # 输入层正则化
+        self.input_dropout = nn.Dropout(dropout * 0.5)  # 输入层使用较小dropout
+        
+        # 构建网络层
+        layers = []
+        prev_dim = input_dim
+        
+        for i, hidden_dim in enumerate(hidden_dims):
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            
+            # 归一化层
+            if use_batch_norm:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            elif use_layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            
+            # 激活函数
+            layers.append(act_fn)
+            
+            # Dropout - 越深层dropout越大
+            layer_dropout = dropout * (1 + i * 0.1)  # 渐进式dropout
+            layer_dropout = min(layer_dropout, 0.7)  # 最大不超过0.7
+            layers.append(nn.Dropout(layer_dropout))
+            
+            prev_dim = hidden_dim
+        
+        # 输出层
+        self.hidden_layers = nn.Sequential(*layers)
+        self.output_layer = nn.Linear(prev_dim, output_dim)
+        
+        # 权重初始化
+        self._init_weights()
+        
+    def _init_weights(self):
+        """使用Xavier初始化权重，减少梯度消失/爆炸"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                    
+    def forward(self, x):
+        """前向传播"""
+        x = self.input_dropout(x)
+        x = self.hidden_layers(x)
+        output = self.output_layer(x)
+        
         if self.task_type == 'multiclass':
             output = F.softmax(output, dim=1)
         

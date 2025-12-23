@@ -2,6 +2,7 @@
 完整的药物筛选模型训练脚本
 支持多个MoleculeNet数据集：BBBP、ESOL、Tox21
 数据下载到本地data目录
+使用分层采样确保训练/验证/测试集分布一致，避免过拟合
 """
 import sys
 import os
@@ -62,20 +63,22 @@ sys.path.append('.')
 
 from data.data_loader import DrugDataLoader
 from features.feature_extraction import MolecularFeaturizer  # 使用新的模块名
-from models.drug_models import DrugPredictorMLP
-from training.trainer import DrugModelTrainer, create_data_loaders
+from models.drug_models import DrugPredictorMLP, DrugPredictorMLPv2  # 添加增强版模型
+from training.trainer_v2 import DrugModelTrainer  # 使用简洁版训练器
+from training.trainer import create_data_loaders  # 数据加载器辅助函数
 from evaluation.metrics import ModelEvaluator, ResultVisualizer
 
 
 def train_bbbp():
-    """训练BBBP血脑屏障穿透性预测模型"""
+    """训练BBBP血脑屏障穿透性预测模型 - 使用分层采样避免过拟合"""
     print("\n" + "="*70)
     print("  BBBP 血脑屏障穿透性预测模型训练")
     print("  Blood-Brain Barrier Penetration Prediction")
+    print("  使用分层采样确保类别分布一致")
     print("="*70)
     
-    # 1. 数据加载（下载到本地data目录，抑制DeepChem警告）
-    print("\n[Step 1/6] 加载MoleculeNet BBBP数据集...")
+    # 1. 数据加载 - 使用分层采样
+    print("\n[Step 1/6] 加载MoleculeNet BBBP数据集（分层采样）...")
     print("  数据将保存到: ./data/raw/bbbp/")
     print("  (正在加载中，请稍候...)")
     loader = DrugDataLoader(data_dir='./data/raw')
@@ -84,34 +87,26 @@ def train_bbbp():
     import io
     from contextlib import redirect_stdout, redirect_stderr
     
+    # 使用分层采样确保类别分布一致
     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-        train_data, valid_data, test_data, tasks = loader.load_moleculenet_dataset(
-            dataset_name='BBBP',
-            featurizer='ECFP',
-            split='scaffold',
-            save_local=True  # 保存到本地CSV
-        )
+        X_train, y_train, X_valid, y_valid, X_test, y_test, tasks = \
+            loader.load_moleculenet_with_stratified_split(
+                dataset_name='BBBP',
+                featurizer='ECFP',
+                train_ratio=0.8,
+                val_ratio=0.1,
+                test_ratio=0.1,
+                random_state=42
+            )
     
     print("  数据加载完成!")
     
-    # 2. 提取特征
-    print("\n[Step 2/6] 提取分子特征 (ECFP指纹)...")
-    X_train = train_data.X
-    y_train = train_data.y.flatten()
-    X_valid = valid_data.X
-    y_valid = valid_data.y.flatten()
-    X_test = test_data.X
-    y_test = test_data.y.flatten()
-    
-    # 处理NaN
-    y_train = np.nan_to_num(y_train, nan=0.0)
-    y_valid = np.nan_to_num(y_valid, nan=0.0)
-    y_test = np.nan_to_num(y_test, nan=0.0)
-    
+    # 2. 数据统计
+    print("\n[Step 2/6] 数据分布统计...")
     print(f"  特征维度: {X_train.shape[1]}")
-    print(f"  训练集: {len(X_train)} 样本 (正例比例: {y_train.mean():.2%})")
-    print(f"  验证集: {len(X_valid)} 样本 (正例比例: {y_valid.mean():.2%})")
-    print(f"  测试集: {len(X_test)} 样本 (正例比例: {y_test.mean():.2%})")
+    print(f"  训练集: {len(X_train)} 样本 (正例比例: {(y_train > 0.5).mean():.2%})")
+    print(f"  验证集: {len(X_valid)} 样本 (正例比例: {(y_valid > 0.5).mean():.2%})")
+    print(f"  测试集: {len(X_test)} 样本 (正例比例: {(y_test > 0.5).mean():.2%})")
     
     # 3. 创建数据加载器
     print("\n[Step 3/6] 创建PyTorch数据加载器...")
@@ -119,20 +114,23 @@ def train_bbbp():
         X_train, y_train, X_valid, y_valid, batch_size=32
     )
     
-    # 4. 创建模型
-    print("\n[Step 4/6] 创建MLP神经网络模型...")
+    # 4. 创建增强版模型 - 更强的正则化
+    print("\n[Step 4/6] 创建增强版MLP神经网络模型...")
     input_dim = X_train.shape[1]
-    model = DrugPredictorMLP(
+    model = DrugPredictorMLPv2(
         input_dim=input_dim,
-        hidden_dims=[512, 256, 128],
+        hidden_dims=[256, 128, 64],  # 更小的网络减少过拟合
         output_dim=1,
-        dropout=0.5,
+        dropout=0.5,           # 更高的dropout
+        use_batch_norm=True,
+        activation='leaky_relu',
         task_type='binary'
     )
     
     param_count = sum(p.numel() for p in model.parameters())
-    print(f"  网络结构: {input_dim} -> 512 -> 256 -> 128 -> 1")
+    print(f"  网络结构: {input_dim} -> 256 -> 128 -> 64 -> 1")
     print(f"  总参数量: {param_count:,}")
+    print(f"  正则化: Dropout=0.5, BatchNorm, 渐进式Dropout")
     
     # 5. 训练
     print("\n[Step 5/6] 开始GPU加速训练...")
@@ -144,8 +142,11 @@ def train_bbbp():
     trainer = DrugModelTrainer(
         model=model,
         device=device,
-        learning_rate=0.0005,
-        task_type='binary'
+        learning_rate=0.0005,  # 较低学习率避免过快收敛
+        weight_decay=1e-3,     # 较强L2正则化
+        task_type='binary',
+        use_scheduler=True,
+        scheduler_type='plateau'
     )
     
     os.makedirs('./saved_models', exist_ok=True)
@@ -153,8 +154,8 @@ def train_bbbp():
     trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
-        epochs=200,
-        early_stopping_patience=30,
+        epochs=150,            # 适度epochs
+        early_stopping_patience=25,  # 早停耐心值
         save_best_model=True,
         model_save_path='./saved_models/bbbp_model.pth'
     )
@@ -172,9 +173,12 @@ def train_bbbp():
     
     y_pred_labels = (y_pred_prob > 0.5).astype(int)
     
+    # 转换标签为整数
+    y_test_int = (y_test > 0.5).astype(int)
+    
     evaluator = ModelEvaluator()
     metrics = evaluator.evaluate_classification(
-        y_test.astype(int), y_pred_labels, y_prob=y_pred_prob
+        y_test_int, y_pred_labels, y_prob=y_pred_prob
     )
     
     print("\n" + "-"*50)
@@ -192,9 +196,9 @@ def train_bbbp():
     visualizer = ResultVisualizer(save_dir='./evaluation/figures')
     
     visualizer.plot_training_history(trainer.history, save_name='bbbp_training_history.png')
-    visualizer.plot_roc_curve(y_test.astype(int), y_pred_prob, 
+    visualizer.plot_roc_curve(y_test_int, y_pred_prob, 
                               title='BBBP ROC Curve', save_name='bbbp_roc_curve.png')
-    visualizer.plot_confusion_matrix(y_test.astype(int), y_pred_labels,
+    visualizer.plot_confusion_matrix(y_test_int, y_pred_labels,
                                      labels=['Non-penetrating', 'Penetrating'],
                                      title='BBBP Confusion Matrix', 
                                      save_name='bbbp_confusion_matrix.png')
@@ -203,13 +207,14 @@ def train_bbbp():
 
 
 def train_esol():
-    """训练ESOL水溶解度预测模型（回归任务）"""
+    """训练ESOL水溶解度预测模型（回归任务）- 使用随机分割"""
     print("\n" + "="*70)
     print("  ESOL 水溶解度预测模型训练")
     print("  Aqueous Solubility Prediction (Regression)")
+    print("  使用随机分割确保数据分布一致")
     print("="*70)
     
-    # 1. 数据加载（抑制DeepChem警告）
+    # 1. 数据加载 - 使用分层采样函数（回归任务会自动使用随机分割）
     print("\n[Step 1/6] 加载MoleculeNet ESOL数据集...")
     print("  (正在加载中，请稍候...)")
     loader = DrugDataLoader(data_dir='./data/raw')
@@ -218,27 +223,24 @@ def train_esol():
     from contextlib import redirect_stdout, redirect_stderr
     
     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-        train_data, valid_data, test_data, tasks = loader.load_moleculenet_dataset(
-            dataset_name='ESOL',
-            featurizer='ECFP',
-            split='scaffold'
-        )
+        X_train, y_train, X_valid, y_valid, X_test, y_test, tasks = \
+            loader.load_moleculenet_with_stratified_split(
+                dataset_name='ESOL',
+                featurizer='ECFP',
+                train_ratio=0.8,
+                val_ratio=0.1,
+                test_ratio=0.1,
+                random_state=42
+            )
     
     print("  数据加载完成!")
     
-    # 2. 提取特征
-    print("\n[Step 2/6] 提取分子特征...")
-    X_train = train_data.X
-    y_train = train_data.y.flatten()
-    X_valid = valid_data.X
-    y_valid = valid_data.y.flatten()
-    X_test = test_data.X
-    y_test = test_data.y.flatten()
-    
+    # 2. 数据统计
+    print("\n[Step 2/6] 数据分布统计...")
     print(f"  特征维度: {X_train.shape[1]}")
-    print(f"  训练集: {len(X_train)} 样本")
-    print(f"  验证集: {len(X_valid)} 样本")
-    print(f"  测试集: {len(X_test)} 样本")
+    print(f"  训练集: {len(X_train)} 样本, 均值: {y_train.mean():.3f}")
+    print(f"  验证集: {len(X_valid)} 样本, 均值: {y_valid.mean():.3f}")
+    print(f"  测试集: {len(X_test)} 样本, 均值: {y_test.mean():.3f}")
     print(f"  溶解度范围: [{y_train.min():.2f}, {y_train.max():.2f}] log mol/L")
     
     # 3. 创建数据加载器
@@ -247,18 +249,22 @@ def train_esol():
         X_train, y_train, X_valid, y_valid, batch_size=32
     )
     
-    # 4. 创建回归模型
-    print("\n[Step 4/6] 创建回归模型...")
+    # 4. 创建增强版回归模型
+    print("\n[Step 4/6] 创建增强版回归模型...")
     input_dim = X_train.shape[1]
-    model = DrugPredictorMLP(
+    model = DrugPredictorMLPv2(
         input_dim=input_dim,
-        hidden_dims=[512, 256, 128],
+        hidden_dims=[256, 128, 64],  # 较小网络
         output_dim=1,
-        dropout=0.3,
+        dropout=0.4,           # 适中dropout
+        use_batch_norm=True,
+        activation='leaky_relu',
         task_type='regression'
     )
     
+    print(f"  网络结构: {input_dim} -> 256 -> 128 -> 64 -> 1")
     print(f"  模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  正则化: Dropout=0.4, BatchNorm, 渐进式Dropout")
     
     # 5. 训练
     print("\n[Step 5/6] 开始训练...")
@@ -267,15 +273,18 @@ def train_esol():
     trainer = DrugModelTrainer(
         model=model,
         device=device,
-        learning_rate=0.001,
-        task_type='regression'
+        learning_rate=0.0005,  # 适中学习率
+        weight_decay=5e-4,     # 较强L2正则化
+        task_type='regression',
+        use_scheduler=True,
+        scheduler_type='plateau'
     )
     
     trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
-        epochs=200,
-        early_stopping_patience=35,
+        epochs=150,            # 适度epochs
+        early_stopping_patience=30,  # 早停耐心值
         save_best_model=True,
         model_save_path='./saved_models/esol_model.pth'
     )

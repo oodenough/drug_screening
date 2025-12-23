@@ -1,6 +1,7 @@
 """
-模型训练模块
+模型训练模块 V2 - 简洁版
 提供训练、验证、早停等功能
+移除批次级进度条，只保留简洁的表格输出
 """
 
 import torch
@@ -9,10 +10,9 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-from typing import Optional, Tuple, Dict
-from tqdm import tqdm
+from typing import Optional, Tuple, Dict, List
 import os
-import sys
+import time
 
 
 class EarlyStopping:
@@ -33,15 +33,6 @@ class EarlyStopping:
         self.early_stop = False
         
     def __call__(self, score: float) -> bool:
-        """
-        检查是否应该早停
-        
-        Args:
-            score: 当前评估指标
-            
-        Returns:
-            是否应该早停
-        """
         if self.best_score is None:
             self.best_score = score
             return False
@@ -70,7 +61,7 @@ class EarlyStopping:
 
 
 class DrugModelTrainer:
-    """药物模型训练器 - 优化版"""
+    """药物模型训练器 V2 - 简洁版"""
     
     def __init__(self,
                  model: nn.Module,
@@ -81,6 +72,8 @@ class DrugModelTrainer:
                  use_scheduler: bool = True,
                  scheduler_type: str = 'plateau'):
         """
+        初始化训练器
+        
         Args:
             model: PyTorch模型
             device: 训练设备 ('cuda' or 'cpu')
@@ -106,7 +99,7 @@ class DrugModelTrainer:
         else:
             raise ValueError(f"Unknown task type: {task_type}")
         
-        # 优化器 - 添加权重衰减
+        # 优化器 - AdamW 带权重衰减
         self.optimizer = optim.AdamW(
             model.parameters(), 
             lr=learning_rate,
@@ -142,26 +135,19 @@ class DrugModelTrainer:
             'learning_rate': []
         }
         
-    def train_epoch(self, train_loader: DataLoader, epoch_pbar=None) -> Tuple[float, float]:
+    def train_epoch(self, train_loader: DataLoader) -> Tuple[float, float]:
         """
-        训练一个epoch，使用内部batch进度条
+        训练一个epoch（无进度条，静默模式）
+        
+        Returns:
+            (平均损失, 评估指标)
         """
         self.model.train()
         total_loss = 0
         all_predictions = []
         all_targets = []
         
-        # 创建batch进度条
-        batch_pbar = tqdm(
-            train_loader, 
-            desc='  Train', 
-            leave=False,
-            ncols=80,
-            bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-            file=sys.stdout
-        )
-        
-        for batch_x, batch_y in batch_pbar:
+        for batch_x, batch_y in train_loader:
             batch_x = batch_x.to(self.device)
             batch_y = batch_y.to(self.device)
             
@@ -184,11 +170,6 @@ class DrugModelTrainer:
             total_loss += loss.item()
             all_predictions.extend(predictions.detach().cpu().numpy())
             all_targets.extend(batch_y.cpu().numpy())
-            
-            # 更新batch进度条
-            batch_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-        
-        batch_pbar.close()
         
         avg_loss = total_loss / len(train_loader)
         metric = self._calculate_metric(np.array(all_predictions), np.array(all_targets))
@@ -196,23 +177,19 @@ class DrugModelTrainer:
         return avg_loss, metric
     
     def validate(self, val_loader: DataLoader) -> Tuple[float, float]:
-        """验证模型"""
+        """
+        验证模型（无进度条，静默模式）
+        
+        Returns:
+            (平均损失, 评估指标)
+        """
         self.model.eval()
         total_loss = 0
         all_predictions = []
         all_targets = []
         
         with torch.no_grad():
-            batch_pbar = tqdm(
-                val_loader, 
-                desc='  Valid', 
-                leave=False,
-                ncols=80,
-                bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt}',
-                file=sys.stdout
-            )
-            
-            for batch_x, batch_y in batch_pbar:
+            for batch_x, batch_y in val_loader:
                 batch_x = batch_x.to(self.device)
                 batch_y = batch_y.to(self.device)
                 
@@ -222,8 +199,6 @@ class DrugModelTrainer:
                 total_loss += loss.item()
                 all_predictions.extend(predictions.cpu().numpy())
                 all_targets.extend(batch_y.cpu().numpy())
-            
-            batch_pbar.close()
         
         avg_loss = total_loss / len(val_loader)
         metric = self._calculate_metric(np.array(all_predictions), np.array(all_targets))
@@ -231,24 +206,15 @@ class DrugModelTrainer:
         return avg_loss, metric
     
     def _calculate_metric(self, predictions: np.ndarray, targets: np.ndarray) -> float:
-        """
-        计算评估指标
-        
-        Args:
-            predictions: 预测值
-            targets: 真实值
-            
-        Returns:
-            评估指标值
-        """
+        """计算评估指标"""
         if self.task_type == 'regression':
             # RMSE
             mse = np.mean((predictions - targets) ** 2)
             return np.sqrt(mse)
         elif self.task_type == 'binary':
-            # AUC-ROC (简化版：使用准确率)
+            # 准确率 (简化版)
             pred_labels = (predictions > 0.5).astype(int)
-            accuracy = np.mean(pred_labels == targets)
+            accuracy = np.mean(pred_labels.flatten() == targets.flatten())
             return accuracy
         elif self.task_type == 'multiclass':
             # 准确率
@@ -257,6 +223,13 @@ class DrugModelTrainer:
             return accuracy
         else:
             return 0.0
+    
+    def _print_progress_bar(self, current: int, total: int, width: int = 30):
+        """打印简单的进度条"""
+        percent = current / total
+        filled = int(width * percent)
+        bar = '█' * filled + '░' * (width - filled)
+        return f"[{bar}] {current:3d}/{total}"
     
     def fit(self,
             train_loader: DataLoader,
@@ -267,7 +240,7 @@ class DrugModelTrainer:
             model_save_path: str = './saved_models/best_model.pth',
             verbose: bool = True):
         """
-        训练模型 - 优化版本，更美观的进度显示
+        训练模型 - 简洁版本
         
         Args:
             train_loader: 训练数据加载器
@@ -279,18 +252,21 @@ class DrugModelTrainer:
             verbose: 是否显示详细信息
         """
         # 打印训练配置
-        print("\n" + "="*70)
-        print("                    训练配置")
-        print("="*70)
-        print(f"  设备: {self.device}")
-        if self.device == 'cuda':
-            print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  模型参数: {sum(p.numel() for p in self.model.parameters()):,}")
-        print(f"  学习率: {self.learning_rate}")
-        print(f"  总轮数: {epochs}")
-        print(f"  早停耐心: {early_stopping_patience}")
-        print(f"  学习率调度: {'启用' if self.use_scheduler else '禁用'}")
-        print("="*70 + "\n")
+        if verbose:
+            print("\n" + "=" * 70)
+            print("                        训练配置")
+            print("=" * 70)
+            print(f"  设备: {self.device}", end="")
+            if self.device == 'cuda':
+                print(f" ({torch.cuda.get_device_name(0)})")
+            else:
+                print()
+            print(f"  模型参数: {sum(p.numel() for p in self.model.parameters()):,}")
+            print(f"  学习率: {self.learning_rate}")
+            print(f"  总轮数: {epochs}")
+            print(f"  早停耐心: {early_stopping_patience}")
+            print(f"  学习率调度: {'启用' if self.use_scheduler else '禁用'}")
+            print("=" * 70)
         
         # 早停
         early_stopping = None
@@ -302,11 +278,17 @@ class DrugModelTrainer:
         metric_name = 'RMSE' if self.task_type == 'regression' else 'Acc'
         
         # 打印表头
-        header = f"{'Epoch':^8}|{'Train Loss':^12}|{f'Train {metric_name}':^12}|{'Val Loss':^12}|{f'Val {metric_name}':^12}|{'LR':^12}|{'Status':^10}"
-        print(header)
-        print("-" * len(header))
+        if verbose:
+            print()
+            print(f"┌{'─'*8}┬{'─'*12}┬{'─'*12}┬{'─'*12}┬{'─'*12}┬{'─'*12}┬{'─'*10}┐")
+            print(f"│{'Epoch':^8}│{'TrainLoss':^12}│{f'Train{metric_name}':^12}│{'ValLoss':^12}│{f'Val{metric_name}':^12}│{'LR':^12}│{'Status':^10}│")
+            print(f"├{'─'*8}┼{'─'*12}┼{'─'*12}┼{'─'*12}┼{'─'*12}┼{'─'*12}┼{'─'*10}┤")
+        
+        start_time = time.time()
         
         for epoch in range(epochs):
+            epoch_start = time.time()
+            
             # 训练一个epoch
             train_loss, train_metric = self.train_epoch(train_loader)
             
@@ -341,101 +323,128 @@ class DrugModelTrainer:
                     torch.save(self.model.state_dict(), model_save_path)
             
             # 打印epoch结果
-            print(f"{epoch+1:^8}|{train_loss:^12.4f}|{train_metric:^12.4f}|{val_loss:^12.4f}|{val_metric:^12.4f}|{current_lr:^12.6f}|{status:^10}")
+            if verbose:
+                lr_str = f"{current_lr:.2e}" if current_lr < 0.001 else f"{current_lr:.6f}"
+                print(f"│{epoch+1:^8}│{train_loss:^12.4f}│{train_metric:^12.4f}│{val_loss:^12.4f}│{val_metric:^12.4f}│{lr_str:^12}│{status:^10}│")
             
             # 早停检查
             if early_stopping and early_stopping(val_loss):
-                print("-" * len(header))
-                print(f"\n✓ 早停触发！在第 {epoch+1} 轮停止训练")
-                print(f"  最佳验证损失: {best_val_loss:.4f} (Epoch {best_epoch})")
-                print(f"  早停计数: {early_stopping_patience} 轮无改善")
+                if verbose:
+                    print(f"└{'─'*8}┴{'─'*12}┴{'─'*12}┴{'─'*12}┴{'─'*12}┴{'─'*12}┴{'─'*10}┘")
+                    print()
+                    print(f"⚡ 早停触发！在第 {epoch+1} 轮停止训练")
+                    print(f"   最佳验证损失: {best_val_loss:.4f} (Epoch {best_epoch})")
+                    print(f"   早停计数: {early_stopping_patience} 轮无改善")
                 break
         else:
-            print("-" * len(header))
-            print(f"\n✓ 训练完成！达到最大轮数 {epochs}")
+            if verbose:
+                print(f"└{'─'*8}┴{'─'*12}┴{'─'*12}┴{'─'*12}┴{'─'*12}┴{'─'*12}┴{'─'*10}┘")
         
-        print(f"\n最终结果:")
-        print(f"  最佳验证损失: {best_val_loss:.4f} (Epoch {best_epoch})")
-        print(f"  模型已保存到: {model_save_path}")
-        print("="*70 + "\n")
+        # 训练完成信息
+        total_time = time.time() - start_time
+        if verbose:
+            print()
+            print(f"✓ 训练完成")
+            print(f"   总耗时: {total_time:.1f}秒 ({total_time/60:.1f}分钟)")
+            print(f"   最佳验证损失: {best_val_loss:.4f} (Epoch {best_epoch})")
+            print(f"   模型已保存到: {model_save_path}")
         
-    def predict(self, X: np.ndarray) -> np.ndarray:
+        return self.history
+    
+    def predict(self, data_loader: DataLoader) -> np.ndarray:
         """
-        预测
+        使用训练好的模型进行预测
         
         Args:
-            X: 输入特征
+            data_loader: 数据加载器
             
         Returns:
-            预测结果
+            预测结果数组
         """
         self.model.eval()
+        predictions = []
         
         with torch.no_grad():
-            X_tensor = torch.FloatTensor(X).to(self.device)
-            predictions = self.model(X_tensor)
+            for batch_x, _ in data_loader:
+                batch_x = batch_x.to(self.device)
+                pred = self.model(batch_x)
+                predictions.extend(pred.cpu().numpy())
+        
+        return np.array(predictions)
+    
+    def evaluate(self, test_loader: DataLoader) -> Dict[str, float]:
+        """
+        在测试集上评估模型
+        
+        Args:
+            test_loader: 测试数据加载器
             
-        return predictions.cpu().numpy()
+        Returns:
+            包含各项指标的字典
+        """
+        self.model.eval()
+        all_predictions = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for batch_x, batch_y in test_loader:
+                batch_x = batch_x.to(self.device)
+                predictions = self.model(batch_x)
+                all_predictions.extend(predictions.cpu().numpy())
+                all_targets.extend(batch_y.numpy())
+        
+        predictions = np.array(all_predictions)
+        targets = np.array(all_targets)
+        
+        if self.task_type == 'regression':
+            mse = np.mean((predictions - targets) ** 2)
+            rmse = np.sqrt(mse)
+            mae = np.mean(np.abs(predictions - targets))
+            
+            # R^2
+            ss_res = np.sum((targets - predictions) ** 2)
+            ss_tot = np.sum((targets - np.mean(targets)) ** 2)
+            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+            
+            # Pearson相关系数
+            if len(predictions) > 1:
+                corr = np.corrcoef(predictions.flatten(), targets.flatten())[0, 1]
+            else:
+                corr = 0
+            
+            return {
+                'RMSE': rmse,
+                'MAE': mae,
+                'R2': r2,
+                'Pearson': corr
+            }
+        
+        elif self.task_type == 'binary':
+            from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score, accuracy_score
+            
+            # Sigmoid处理
+            pred_probs = 1 / (1 + np.exp(-predictions.flatten()))
+            pred_labels = (pred_probs > 0.5).astype(int)
+            targets_flat = targets.flatten().astype(int)
+            
+            return {
+                'AUC-ROC': roc_auc_score(targets_flat, pred_probs),
+                'F1': f1_score(targets_flat, pred_labels),
+                'Precision': precision_score(targets_flat, pred_labels),
+                'Recall': recall_score(targets_flat, pred_labels),
+                'Accuracy': accuracy_score(targets_flat, pred_labels)
+            }
+        
+        else:
+            pred_labels = np.argmax(predictions, axis=1)
+            accuracy = np.mean(pred_labels == targets)
+            return {'Accuracy': accuracy}
     
     def load_model(self, model_path: str):
         """加载模型权重"""
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-        print(f"模型已从 {model_path} 加载")
-
-
-def create_data_loaders(X_train: np.ndarray,
-                        y_train: np.ndarray,
-                        X_val: np.ndarray,
-                        y_val: np.ndarray,
-                        batch_size: int = 32) -> Tuple[DataLoader, DataLoader]:
-    """
-    创建数据加载器
-    
-    Args:
-        X_train: 训练特征
-        y_train: 训练标签
-        X_val: 验证特征
-        y_val: 验证标签
-        batch_size: 批次大小
+        self.model.eval()
         
-    Returns:
-        (train_loader, val_loader)
-    """
-    # 转换为Tensor
-    X_train_tensor = torch.FloatTensor(X_train)
-    y_train_tensor = torch.FloatTensor(y_train)
-    X_val_tensor = torch.FloatTensor(X_val)
-    y_val_tensor = torch.FloatTensor(y_val)
-    
-    # 创建Dataset
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
-    
-    # 创建DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
-    return train_loader, val_loader
-
-
-if __name__ == "__main__":
-    # 测试训练器
-    from models.drug_models import DrugPredictorMLP
-    
-    print("生成模拟数据...")
-    X_train = np.random.randn(1000, 2048)
-    y_train = np.random.randn(1000)
-    X_val = np.random.randn(200, 2048)
-    y_val = np.random.randn(200)
-    
-    print("创建数据加载器...")
-    train_loader, val_loader = create_data_loaders(X_train, y_train, X_val, y_val, batch_size=32)
-    
-    print("创建模型...")
-    model = DrugPredictorMLP(input_dim=2048, hidden_dims=[512, 256], output_dim=1)
-    
-    print("创建训练器...")
-    trainer = DrugModelTrainer(model, learning_rate=0.001, task_type='regression')
-    
-    print("开始训练...")
-    trainer.fit(train_loader, val_loader, epochs=5, early_stopping_patience=3)
+    def get_history(self) -> Dict[str, List[float]]:
+        """获取训练历史"""
+        return self.history
